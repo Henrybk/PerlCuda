@@ -1,0 +1,11 @@
+/build/*
+!/build/.gitkeep
+*.obj
+*.o
+*.exp
+*.lib
+*.dll
+*.so
+*.pdb
+*.csv
+*.log
