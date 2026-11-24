@@ -17,10 +17,14 @@ my @cases = (
     ['03_cpp_ffi.pl', join('', $prefix, 'blockdist_cpu.', $ext)],
     ['04_cuda_ffi.pl', join('', $prefix, 'blockdist_cuda.', $ext)],
     ['05_cuda_cached_ffi.pl', join('', $prefix, 'blockdist_cuda.', $ext)],
+    ['06_cpp_packed.pl', join('', $prefix, 'blockdist_cpu.', $ext), 'prepacked'],
+    ['07_cuda_packed.pl', join('', $prefix, 'blockdist_cuda.', $ext), 'prepacked'],
+    ['06_cpp_packed.pl', join('', $prefix, 'blockdist_cpu.', $ext), 'end-to-end'],
+    ['07_cuda_packed.pl', join('', $prefix, 'blockdist_cuda.', $ext), 'end-to-end'],
 );
 print "method,size,repeats,elapsed_seconds,microseconds_per_batch,nanoseconds_per_distance,checksum\n";
 for my $case (@cases) {
-    my ($script, $lib) = @$case;
+    my ($script, $lib, $mode) = @$case;
     if ($lib && !$ffi_available) {
         warn "SKIP $script: FFI::Platypus not installed\n";
         next;
@@ -31,5 +35,6 @@ for my $case (@cases) {
     }
     my @cmd = ($^X, File::Spec->catfile($FindBin::Bin, $script),
                '--size', $size, '--repeats', $repeats, '--csv');
+    push @cmd, ('--mode', $mode) if defined $mode;
     system(@cmd) == 0 or die "$script failed (exit code $?)\n";
 }

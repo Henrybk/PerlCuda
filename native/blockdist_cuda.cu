@@ -85,3 +85,68 @@ API int blockdist_cuda_cached(const int32_t* x1, const int32_t* y1,
     return execute(cached, x1, y1, x2, y2, out, n);
 }
 API void blockdist_cuda_release() { release(cached); }
+
+
+// Diagnostic entry point only; DO NOT use this instrumented path for regular
+// speed comparisons. Host wall measures synchronous pageable-memory copies;
+// the kernel is measured separately with CUDA events on the default stream.
+#include <chrono>
+API int blockdist_cuda_profile_cached(const int32_t* x1, const int32_t* y1,
+                                      const int32_t* x2, const int32_t* y2,
+                                      int32_t* out, int32_t n,
+                                      float* metrics_ms) {
+    if (!x1 || !y1 || !x2 || !y2 || !out || !metrics_ms || n <= 0) return -1;
+    if (n > cached.capacity) {
+        release(cached);
+        const cudaError_t allocation = allocate(cached, n);
+        if (allocation != cudaSuccess) {
+            release(cached);
+            return (int)allocation;
+        }
+    }
+
+    cudaEvent_t start_event = nullptr;
+    cudaEvent_t stop_event = nullptr;
+    cudaError_t e = cudaEventCreate(&start_event);
+    if (e != cudaSuccess) return (int)e;
+    e = cudaEventCreate(&stop_event);
+    if (e != cudaSuccess) {
+        cudaEventDestroy(start_event);
+        return (int)e;
+    }
+
+    const size_t bytes = static_cast<size_t>(n) * sizeof(int32_t);
+    using Clock = std::chrono::steady_clock;
+    const auto all_start = Clock::now();
+    const auto h2d_start = Clock::now();
+    // Run all transfers synchronously, so the host timers include driver time.
+    if ((e = cudaMemcpy(cached.x1, x1, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) goto cleanup;
+    if ((e = cudaMemcpy(cached.y1, y1, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) goto cleanup;
+    if ((e = cudaMemcpy(cached.x2, x2, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) goto cleanup;
+    if ((e = cudaMemcpy(cached.y2, y2, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) goto cleanup;
+
+    {
+        const auto h2d_end = Clock::now();
+        if ((e = cudaEventRecord(start_event)) != cudaSuccess) goto cleanup;
+        constexpr int threads = 256;
+        blockdist_kernel<<<(n + threads - 1) / threads, threads>>>(
+            cached.x1, cached.y1, cached.x2, cached.y2, cached.out, n);
+        if ((e = cudaGetLastError()) != cudaSuccess) goto cleanup;
+        if ((e = cudaEventRecord(stop_event)) != cudaSuccess) goto cleanup;
+        if ((e = cudaEventSynchronize(stop_event)) != cudaSuccess) goto cleanup;
+        float kernel_ms = 0.0f;
+        if ((e = cudaEventElapsedTime(&kernel_ms, start_event, stop_event)) != cudaSuccess) goto cleanup;
+
+        const auto d2h_start = Clock::now();
+        if ((e = cudaMemcpy(out, cached.out, bytes, cudaMemcpyDeviceToHost)) != cudaSuccess) goto cleanup;
+        const auto all_end = Clock::now();
+        metrics_ms[0] = std::chrono::duration<float, std::milli>(h2d_end - h2d_start).count();
+        metrics_ms[1] = kernel_ms;
+        metrics_ms[2] = std::chrono::duration<float, std::milli>(all_end - d2h_start).count();
+        metrics_ms[3] = std::chrono::duration<float, std::milli>(all_end - all_start).count();
+    }
+cleanup:
+    cudaEventDestroy(stop_event);
+    cudaEventDestroy(start_event);
+    return (int)e;
+}

@@ -1,83 +1,105 @@
 # PerlCuda
 
-**Standalone Perl + C++ + CUDA batch benchmark.** No OpenKore dependencies.
+Standalone **Perl vs C++ vs CUDA** benchmark for batched Chebyshev (block) distance. No OpenKore dependencies.
 
-The workload is **1,000 independent block-distance calculations per batch**. Distance is defined as the Chebyshev distance on an 8-direction grid:
+Distance: `max(abs(x2-x1), abs(y2-y1))`. All implementations use deterministic integer coordinates and must match the Perl reference. The default is 1,000 distances per batch.
 
-    blockDistance((x1,y1),(x2,y2)) = max(abs(x2-x1), abs(y2-y1))
+## Backends
 
-All five implementations use identical deterministic inputs, check each result before timing, and produce a checksum. This evaluates end-to-end overhead; for such cheap arithmetic, the GPU may be slower than the CPU.
-
-## Five implementation scripts
-
-| Script | Backend | What it includes |
+| Script | Implementation | What is measured |
 | --- | --- | --- |
-| 01_perl_scalar.pl | Pure Perl | One Perl subroutine call per distance |
-| 02_perl_batch.pl | Pure Perl | One call for the whole batch; inline arithmetic |
-| 03_cpp_ffi.pl | Native C++ | FFI::Platypus array marshaling plus native loop |
-| 04_cuda_ffi.pl | CUDA | Fresh device allocation, host/device transfers, kernel, release |
-| 05_cuda_cached_ffi.pl | CUDA | Reusable device buffers (transfers still happen each batch) |
+| `01_perl_scalar.pl` | Perl scalar | One Perl function call per distance |
+| `02_perl_batch.pl` | Perl batched | Inline Perl loop |
+| `03_cpp_ffi.pl` | C++ FFI arrays | Converts five Perl arrays each call |
+| `04_cuda_ffi.pl` | CUDA fresh | FFI arrays + GPU allocation + copies + kernel |
+| `05_cuda_cached_ffi.pl` | CUDA cached | FFI arrays + copies + kernel, device buffers reused |
+| `06_cpp_packed.pl` | C++ packed | Packed Perl scalar buffers, native pointers |
+| `07_cuda_packed.pl` | CUDA packed | Packed buffers + cached GPU allocations |
+| `08_cuda_profile.pl` | CUDA diagnostics | Separate transfer, kernel and instrumented total timings |
 
-The C-compatible native functions receive four input int32 arrays, an output int32 array and the element count. They return 0 on success. CUDA errors are reported, not silently ignored.
+The first five benchmarks remain available unchanged.
+
+**Packed modes** (`06` and `07`):
+
+- `--mode prepacked` (default): pack four input arrays and allocate output once, before timing. Pass raw pointers without `sint32[]` marshaling. The timed loop includes FFI, native computation, CUDA transfers if applicable, and an O(1) checksum read per call.
+- `--mode end-to-end`: repack all four input arrays, obtain pointers, execute, and unpack all results on *every* iteration. Measures realistic Perl-array preparation plus native execution.
+
+The binary representation is little-endian, signed int32 (`pack('l<*', ...)`). Prepacked buffers remain alive and unchanged throughout each synchronous native call. CUDA cached buffers are process-global and **not thread-safe**.
 
 ## Windows setup
 
-Requirements:
+Use **64-bit Strawberry Perl**, `FFI::Platypus` (with its Buffer module), the MSVC x64 toolchain, and NVIDIA CUDA Toolkit for GPU runs. In the **x64 Native Tools Command Prompt**:
 
-- 64-bit Strawberry Perl and FFI::Platypus (install with cpanm FFI::Platypus)
-- Visual Studio Build Tools with the MSVC x64 C++ toolchain
-- NVIDIA CUDA Toolkit, compatible driver and GPU for the CUDA variants
+```cmd
+cd /d K:\Github\PerlCuda
+git pull
+cpanm FFI::Platypus
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -RequireCuda
+perl test_correctness.pl
+perl test_packed.pl
+perl bench_all.pl --size 1000 --repeats 1000
+```
 
-Open the **x64 Native Tools Command Prompt for Visual Studio** in the repository directory and run:
+If the repo is elsewhere, change the directory. If CUDA is unavailable, omit `-RequireCuda` to build only C++; the combined runner skips missing optional DLLs. GPU runtime errors are not silently ignored.
 
-    cpanm FFI::Platypus
-    powershell -NoProfile -File .\build.ps1 -RequireCuda
-    perl .\test_correctness.pl
-    perl .\bench_all.pl --size 1000 --repeats 1000
+## Run separate modes
 
-If you do not have the CUDA Toolkit installed, omit -RequireCuda. The build script compiles C++ and skips CUDA. The all-in-one runner skips native variants if their DLL or FFI module is absent.
+```cmd
+perl 06_cpp_packed.pl --size 10000 --repeats 1000 --mode prepacked
+perl 07_cuda_packed.pl --size 10000 --repeats 1000 --mode prepacked
+perl 06_cpp_packed.pl --size 10000 --repeats 1000 --mode end-to-end
+perl 07_cuda_packed.pl --size 10000 --repeats 1000 --mode end-to-end
+perl 08_cuda_profile.pl --size 10000 --repeats 200
+```
 
-To benchmark one implementation:
+The combined `bench_all.pl` includes both new packed modes along with the five old methods; it prints CSV with `method,size,repeats,elapsed_seconds,microseconds_per_batch,nanoseconds_per_distance,checksum`.
 
-    perl .\01_perl_scalar.pl --size 1000 --repeats 1000
-    perl .\02_perl_batch.pl --size 1000 --repeats 1000
-    perl .\03_cpp_ffi.pl --size 1000 --repeats 1000
-    perl .\04_cuda_ffi.pl --size 1000 --repeats 1000
-    perl .\05_cuda_cached_ffi.pl --size 1000 --repeats 1000
+For comparisons:
 
-The native DLLs are generated inside build/ by build.ps1. They are not committed to Git.
+```cmd
+perl bench_all.pl --size 1000 --repeats 1000
+perl bench_all.pl --size 10000 --repeats 1000
+perl bench_all.pl --size 100000 --repeats 100
+```
+
+## GPU profiling methodology
+
+`08_cuda_profile.pl` uses a **separate instrumented CUDA function**. It measures:
+
+- **H2D:** host steady-clock wall time for four synchronous pageable-memory transfers.
+- **Kernel:** CUDA event elapsed GPU time between events recorded around the kernel.
+- **D2H:** host steady-clock wall time for synchronous output transfer.
+- **Native wall:** whole instrumented function, including event synchronization.
+- **Perl wall:** FFI calls plus timing reads.
+
+CUDA event creation and synchronization add overhead; these metrics are diagnostic, **not** a decomposition of an uninstrumented benchmark and **not** process CPU time. Uninstrumented `07_cuda_packed.pl` is the appropriate primary performance comparison.
+
+## Earlier baseline: FFI array-marshaling methods
+
+These are the original user-measured *wall microseconds per batch*, **not** results of the new implementations.
+
+| Backend | 1,000 | 10,000 | 100,000 |
+| --- | ---: | ---: | ---: |
+| Perl scalar | 249.9 | 2495.9 | 25552.0 |
+| Perl batch | **171.0** | **1676.4** | **16900.1** |
+| C++ FFI arrays | 194.4 | 1990.1 | 19578.5 |
+| CUDA fresh | 664.4 | 2458.3 | 20220.7 |
+| CUDA cached | 309.4 | 2103.2 | 20278.1 |
+
+The earlier C++ and CUDA FFI calls converted five full Perl arrays on each invocation. The new modes isolate that marshaling cost.
 
 ## Linux (optional)
 
-    cpanm FFI::Platypus
-    bash build.sh
-    perl test_correctness.pl
-    perl bench_all.pl --size 1000 --repeats 1000
+```sh
+cpanm FFI::Platypus
+bash build.sh
+perl test_correctness.pl
+perl test_packed.pl
+perl bench_all.pl --size 1000 --repeats 1000
+```
 
-build.sh builds the native C++ library and, if nvcc is installed, the CUDA library.
+## Limitations
 
-## Measuring fairly
+This is a synchronous, non-pipelined GPU experiment on little-endian x64. Input coordinate ranges avoid signed integer overflow. Packed buffers are ordinary Perl string memory, not CUDA-pinned buffers. Runtime CUDA device execution and performance must be verified on an NVIDIA-enabled machine; compilation alone is insufficient. These results do not demonstrate acceleration of A* or other irregular workloads.
 
-The combined runner prints CSV with these columns:
-
-    method,size,repeats,elapsed_seconds,microseconds_per_batch,nanoseconds_per_distance,checksum
-
-The time **includes** Perl-to-FFI conversion, host/device copies, kernel completion, and return to Perl, but **excludes** library loading and five warm-up calls. It is wall-clock elapsed time, not exclusive process CPU time or GPU-only kernel time.
-
-For comparative data, run several times on the same machine with no competing load. Test batch sizes of 1, 100, 1000, 10000 and 100000, looking for the batch-size crossover. A separate GPU-event benchmark would be necessary to report kernel-only GPU timing.
-
-The correctness suite checks output parity for batch lengths 1, 7, 1000 and 1025, negative coordinates, zero distance and altered inputs. CUDA correctness is tested when its shared library is present; a runtime CUDA failure is an error.
-
-## Design limitations
-
-- Fixed, sequential batch workflow; not an asynchronous GPU pipeline.
-- Reused CUDA buffers are process-global and **not thread-safe**.
-- GPU buffers are cached, but input and output transfers are still performed every call.
-- Coordinate input ranges intentionally avoid signed 32-bit overflow.
-- Outputs are exact integers; no approximate or floating-point shortcuts.
-- No CUDA or OpenKore-specific behavior or data files are required to use the Perl and C++ examples.
-- A win for the GPU here would not prove that it improves A* or other irregular workloads; benchmark those separately.
-
-## License
-
-MIT License. See LICENSE.
+MIT licensed; see [LICENSE](LICENSE).
